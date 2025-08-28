@@ -246,8 +246,25 @@ func (c *Client) rawQuery(domain, server, port string) (string, error) {
 	elapsed = time.Since(start)
 
 	_ = conn.SetReadDeadline(time.Now().Add(c.timeout - elapsed))
-	buffer, err := io.ReadAll(conn)
-	if err != nil {
+	
+	// Read with timeout to handle servers that don't close connections properly
+	var buffer []byte
+	readChan := make(chan []byte)
+	errChan := make(chan error)
+	
+	go func() {
+		data, err := io.ReadAll(conn)
+		if err != nil {
+			errChan <- err
+		} else {
+			readChan <- data
+		}
+	}()
+	
+	select {
+	case data := <-readChan:
+		buffer = data
+	case err := <-errChan:
 		if len(buffer) > 0 {
 			// Some servers may refuse a request with a reason, immediately closing the connection after sending.
 			// For example, GoDaddy returns "Number of allowed queries exceeded.\r\n", and immediately closes the connection.
@@ -259,6 +276,22 @@ func (c *Client) rawQuery(domain, server, port string) (string, error) {
 		}
 
 		return "", fmt.Errorf("whois: read from whois server failed: %w", err)
+	case <-time.After(c.timeout - elapsed):
+		// Force close the connection to stop the goroutine
+		conn.Close()
+		// Wait a bit for the goroutine to finish
+		select {
+		case data := <-readChan:
+			buffer = data
+		case <-errChan:
+			// Connection was closed, which is expected
+		case <-time.After(100 * time.Millisecond):
+			// Goroutine didn't finish, but we have to continue
+		}
+		
+		if len(buffer) == 0 {
+			return "", fmt.Errorf("whois: read from whois server timed out")
+		}
 	}
 
 	return string(buffer), nil
